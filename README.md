@@ -1,4 +1,4 @@
-## [Beyond Random: Automatic Inner-loop Optimization in Dataset Distillation](https://github.com/GH209515338/AT-BPTT/blob/main/README.md)
+## AT-BPTT++: Improving Inner-loop Dataset Distillation with Automatic Reinforcement
 
 
 #### [Project Page](https://github.com/aether-hang/at-bptt-plus) | [Paper]()
