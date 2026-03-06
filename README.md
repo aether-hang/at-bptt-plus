@@ -25,9 +25,9 @@ We summarize our contributions as follows:
 
 📌AT-BPTT achieves:
 
-✅We evaluate AT-BPTT++ on three low-resolution benchmarks, CIFAR-$10$, CIFAR-$100$, and Tiny-ImageNet,  under three distillation budgets (IPC$=\!1,10,50$), and AT-BPTT++ achieves the best performance across all settings. On CIFAR-$10$, it attains $55.7\%$, $74.9\%$, and $81.0\%$ at IPC$=1,10,50$, respectively, consistently improving over AT-BPTT (e.g., $+2.5\%$ at IPC$\!=\!10$). On the more challenging CIFAR-$100$, the gains remain pronounced, especially in the low-data regime: at IPC$=1$, AT-BPTT++ reaches $40.2\%$, outperforming AT-BPTT by $3.3\%$.
+✅We evaluate AT-BPTT++ on three low-resolution benchmarks, CIFAR-10, CIFAR-100, and Tiny-ImageNet,  under three distillation budgets (IPC=1, 10 and 50), and AT-BPTT++ achieves the best performance across all settings. On CIFAR-10, it attains 55.7%, 74.9%, and 81.0% at IPC=1, 10 and 50, respectively, consistently improving over AT-BPTT (e.g., +2.5% at IPC=10). On the more challenging CIFAR-100, the gains remain pronounced, especially in the low-data regime: at IPC=1, AT-BPTT++ reaches 40.2%, outperforming AT-BPTT by 3.3%.
 
-✅We further evaluate AT-BPTT++ on the higher-resolution ImageNet-$1$K benchmark with IPC$=1$ and IPC$=10$, and AT-BPTT++ achieves the best results among all compared methods, with a clear margin in this challenging regime. In particular, at IPC$=10$ it improves over AT-BPTT by $+4.8\%$.
+✅We further evaluate AT-BPTT++ on the higher-resolution ImageNet-1K benchmark with IPC=1 and IPC=10, and AT-BPTT++ achieves the best results among all compared methods, with a clear margin in this challenging regime. In particular, at IPC=10 it improves over AT-BPTT by +4.8%.
 
 ### 🖼️Visualization of Synthetic Images
 
