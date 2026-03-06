@@ -1,10 +1,8 @@
 ## [Beyond Random: Automatic Inner-loop Optimization in Dataset Distillation](https://github.com/GH209515338/AT-BPTT/blob/main/README.md)
 
----
 
 #### [Project Page](https://github.com/aether-hang/at-bptt-plus) | [Paper]()
 
----
 ### 🧠Abstract
 
 Dataset distillation (DD) seeks to synthesize a compact training set that can replace a large dataset with minimal loss in accuracy. A major practical challenge is *inner-loop optimization*: computing meta-gradients by differentiating through long training trajectories via backpropagation through time (BPTT) is costly in time and memory, and is further burdened by second-order curvature terms. Truncated BPTT reduces this cost, but most existing schemes rely on fixed windows or uniformly random truncation positions throughout optimization. Such one-size-fits-all truncation ignores stage-dependent learning dynamics and can yield unstable or suboptimal meta-gradient estimates under gradient-scale drift and noisy training signals. To address this, building on our previous AT-BPTT,  we present **AT-BPTT++**, an inner-loop optimization framework that improves both the robustness and efficiency of truncated meta-gradient computation. AT-BPTT++ introduces two components. First, a within-trajectory policy optimization (WTPO) selector casts the choice of truncation position and window size as a lightweight categorical policy update: per-timestep gradient statistics are standardized within each unrolled trajectory to form scale-invariant advantages, and the truncation policy is updated via a proximal step to a slowly moving reference policy. Second, Cache-and-Refresh LRHA (CR-LRHA) amortizes second-order computation by reusing cached low-rank curvature factors when a cheap drift indicator is small and refreshing them only when necessary. Across standard benchmarks and architectures, AT-BPTT++ consistently improves over prior DD inner-loop optimizers and our conference version, while reducing resource usage and improving stability under realistic noise and configuration changes. 
