@@ -90,9 +90,9 @@ os.environ['CUDA_VISIBLE_DEVICES'] = "0,1"
 **🟠To distill on CIFAR-10 with IPC=10**
 
 ```python
-python main.py --dataset cifar10 --num_per_class 10 --batch_per_class 10 --task_sampler_nc 10 --num_train_eval 8 --world_size 1 --rank 0 --batch_size 5000 --ddtype at_bptt_pp --arch convnet --window 60 --totwindow 200 --window_radius 20 --selector_kl 1.0 --selector_ref_ema 0.05 --selector_tau_w 1.0 --cr_rank 32 --cr_delta 0.05 --cr_period 20 --inner_optim Adam --inner_lr 0.001 --lr 0.001 --epochs 60000 --test_freq 25 --print_freq 10 --zca --syn_strategy flip_rotate --real_strategy flip_rotate --fname at_bptt_pp_cifar10 --seed 41
+python main.py --dataset cifar10 --num_per_class 10 --batch_per_class 10 --task_sampler_nc 10 --train_y --num_train_eval 8 --world_size 1 --rank 0 --batch_size 5000 --ddtype at_bptt_pp --arch convnet --window 16 --totwindow 32 --window_radius 8 --selector_kl 1.0 --selector_ref_ema 0.05 --selector_tau_w 1.0 --cr_rank 32 --cr_delta 0.2 --cr_period 20 --cr_oversample 4 --cr_power_iter 2 --inner_optim Adam --inner_lr 0.001 --lr 0.001 --epochs 60000 --test_freq 25 --print_freq 10 --zca --syn_strategy flip_rotate --real_strategy flip_rotate --comp_aug --comp_aug_real --fname at_bptt_pp_cifar10_ipc10_table1 --seed 41
 ```
-This setting follows the common CIFAR-10 protocol with a long trajectory (`totwindow=200`) and medium truncation window (`window=60`).
+This setting follows the Table-I CIFAR-10 IPC=10 protocol in the TPAMI paper: Conv-3, Gaussian synthetic initialization with projected normalization during optimization, raw positive label optimization, random horizontal flip plus rotation, trajectory length T=32, WTPO hyperparameters lambda_KL=1.0/rho=0.05/tau_w=1.0, and CR-LRHA with HVP randomized-SVD rank 32, oversampling 4, power iterations 2, refresh delta=0.2/K=20. Reported paper numbers average 5 independent seeds.
 
 **🔵To distill on CIFAR-100 with IPC=10**
 

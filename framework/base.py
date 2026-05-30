@@ -7,7 +7,10 @@ import torch.backends.cudnn as cudnn
 from torch.utils.data.dataset import Dataset
 from torch.optim.lr_scheduler import MultiStepLR
 
-import torch_optimizer
+try:
+    import torch_optimizer  # noqa: F401
+except ImportError:
+    torch_optimizer = None
 
 
 import torch.distributed as dist
@@ -37,7 +40,10 @@ from framework.distill_higher import Distill
 from framework.util import Summary, AverageMeter, ProgressMeter, accuracy, accuracy_ind, ImageIntervention, init_gaussian
 
 from statistics import mean
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 os.environ['MASTER_ADDR'] = 'localhost'
 os.environ['MASTER_PORT'] = '5678'
@@ -153,12 +159,15 @@ def main_worker(gpu, ngpus_per_node, args):
         cr_delta=args.cr_delta,
         cr_period=args.cr_period,
         cr_blend=args.cr_blend,
+        cr_oversample=args.cr_oversample,
+        cr_power_iter=args.cr_power_iter,
     )
     print(model.net)
     
-    # The data is intialized with random values, not from real images to remove any bias
-    # We project the data to a unit ball to control the norm.
-    model.data.weight.data = project(model.data.weight)
+    # The data is initialized with Gaussian noise, then normalized as described
+    # in the paper to keep synthetic images numerically stable.
+    if args.normalize_syn:
+        model.data.weight.data = project(model.data.weight)
     
     if not torch.cuda.is_available():
         print('using CPU, this will be slow')
@@ -205,21 +214,39 @@ def main_worker(gpu, ngpus_per_node, args):
     
     # if ckptname is given, load the data from the file as initialization
     if args.ckptname != 'none':
-        db = h5py.File(args.ckptname, 'r')
-        print(db['data'].shape[0], int(x_init.shape[0]/num_classes), args.num_per_class)
-        base_data = torch.tensor(db['data'][:]).cuda()
-        if args.train_y:
-            label_data = torch.tensor(db['label'][:]).cuda()
-            model.module.label.weight.data = label_data
+        with h5py.File(args.ckptname, 'r') as db:
+            print(db['data'].shape[0], int(x_init.shape[0]/num_classes), args.num_per_class)
+            base_data = torch.as_tensor(
+                db['data'][:],
+                dtype=model.module.data.weight.dtype,
+                device=model.module.data.weight.device,
+            )
+            model.module.data.weight.data.copy_(base_data)
+            if args.train_y:
+                if 'label' in db:
+                    label_data = torch.as_tensor(
+                        db['label'][:],
+                        dtype=model.module.label.weight.dtype,
+                        device=model.module.label.weight.device,
+                    )
+                    model.module.label.weight.data.copy_(label_data)
+                else:
+                    print('=== Warning: --train_y requested but ckpt has no label dataset; keeping initialized labels ===')
+        print('=== Successfully loading distilled data from {} ==='.format(args.ckptname))
         continue_training = True
         
     start_test_epoch = 0 if continue_training else 1
         
     if args.train_y:
         if args.outer_optim == 'Adam':
+            data_lr = 0.0 if args.freeze_data else args.lr
             optimizer = optim.Adam([{'params': model.module.data.weight}, 
                                    {'params': model.module.label.weight, 'lr': args.lr/args.label_lr_scale}], 
-                                   lr=args.lr, betas=(0.9, 0.999), eps=args.eps, weight_decay=args.wd)
+                                   lr=data_lr, betas=(0.9, 0.999), eps=args.eps, weight_decay=args.wd)
+            optimizer.param_groups[0]['lr'] = data_lr
+            optimizer.param_groups[1]['lr'] = args.lr/args.label_lr_scale
+            if args.freeze_data:
+                print('=== freeze_data enabled: synthetic image optimizer lr set to 0 ===')
         else:
             raise NotImplementedError()
     else:
@@ -236,6 +263,9 @@ def main_worker(gpu, ngpus_per_node, args):
     if args.ddtype == 'curriculum' and args.cctype != 2:
         model.module.curriculum = [args.totwindow - args.window, args.minwindow, 0, 0, 0, 0][args.cctype]
     
+    if args.wandb and wandb is None:
+        raise ImportError("wandb is required when --wandb is enabled. Install wandb or omit --wandb.")
+
     if model.module.data.weight.get_device() == 0 and args.wandb:
         wandb.init(
                 # set the wandb project where this run will be logged
@@ -272,6 +302,23 @@ def main_worker(gpu, ngpus_per_node, args):
         print('=== Successfully loading the data from {} ==='.format(fname[:-3]+'.pth'))
         model.module.ema_init(args.clip_coef)
         ### TO DO: add EMA loading for distilled data
+
+    if args.eval_only:
+        if model.module.data.weight.get_device() == 0:
+            print('=== Eval-only mode: no outer optimization will be performed ===')
+            print('Testing Results:')
+        test_acc, test_loss, scores = test([test_loader, train_loader], model, criterion, args)
+        if model.module.data.weight.get_device() == 0:
+            tmp_index = test_acc[0].index(max(test_acc[0]))
+            print(test_acc)
+            print({
+                'acc': test_acc[0][tmp_index],
+                'test': test_acc[0],
+                'train': test_acc[1],
+                'ind': tmp_index,
+                'loss': test_loss,
+            })
+        return
 
     for epoch in range(args.start_epoch, args.epochs):
         # initialize the EMA
@@ -314,7 +361,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 if model.module.data.weight.get_device() == 0:
                     best_rec['acc'] = test_acc[0][tmp_index]
                     best_rec['test'] = test_acc[0]
-                    best_rec['train'] = test_acc[0]
+                    best_rec['train'] = test_acc[1]
                     best_rec['ind'] = tmp_index
                     best_rec['epoch'] = epoch + 1
                     best_rec['data'] = model.module.data.weight.data.cpu().clone().numpy()
@@ -358,10 +405,17 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.wandb: wandb.log({"best_acc": best_rec['acc']})
     grad_acc = np.concatenate(grad_acc)
     if model.module.data.weight.get_device() == 0:
-        with h5py.File(fname, 'w') as f:
+        with h5py.File(fname, 'a') as f:
+            if 'grad' in f:
+                del f['grad']
             f.create_dataset('grad', data=grad_acc)
-            best_rec['data'] = model.module.data.weight.data.cpu().clone().numpy()
-            f.create_dataset('data', data=best_rec['data'])
+            final_data = model.module.data.weight.data.cpu().clone().numpy()
+            if 'data' not in f:
+                f.create_dataset('data', data=final_data)
+            else:
+                if 'last_data' in f:
+                    del f['last_data']
+                f.create_dataset('last_data', data=final_data)
     
 def train(train_loader, model, criterion, optimizer, epoch, device, distill_steps, args):
     batch_time = AverageMeter('Time', ':6.3f')
@@ -410,6 +464,8 @@ def train(train_loader, model, criterion, optimizer, epoch, device, distill_step
 
         inputs = inputs.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
+        if hasattr(model.module, 'set_outer_step'):
+            model.module.set_outer_step(distill_steps)
         output, _ = model(inputs)
         loss = criterion(output, targets)
 
@@ -420,23 +476,30 @@ def train(train_loader, model, criterion, optimizer, epoch, device, distill_step
         optimizer.zero_grad()
         loss.backward()
 
-        if args.use_cr_lrha and hasattr(model.module, 'apply_cr_lrha'):
-            model.module.apply_cr_lrha(distill_steps)
+        outer_params = [model.module.data.weight]
+        if args.train_y:
+            outer_params.append(model.module.label.weight)
 
-        data_grad = optimizer.param_groups[0]['params'][0].grad
+        data_grad = model.module.data.weight.grad
         if data_grad is not None:
             data_grad_norm = torch.norm(data_grad.detach(), dim=1)
             grad_norm = calculate_grad_norm(data_grad_norm)
-            grad_energy = (data_grad_norm.pow(2).sum().item()) ** 0.5
         else:
             grad_norm = 0.0
-            grad_energy = 0.0
+        grad_energy_sq = 0.0
+        for param in outer_params:
+            if param.grad is not None:
+                grad_energy_sq += param.grad.detach().pow(2).sum().item()
+        grad_energy = grad_energy_sq ** 0.5
         grad_acc.append(grad_norm)
 
         clip_coef = model.module.ema_update(grad_energy)
-        torch.nn.utils.clip_grad_norm_(model.module.data.weight, max_norm=clip_coef * 2)
+        torch.nn.utils.clip_grad_norm_(outer_params, max_norm=clip_coef * 2)
 
         optimizer.step()
+        if args.normalize_syn:
+            with torch.no_grad():
+                model.module.data.weight.data = project(model.module.data.weight.data)
         optimizer.zero_grad()
         model.module.net.zero_grad()
 
@@ -452,6 +515,17 @@ def train(train_loader, model, criterion, optimizer, epoch, device, distill_step
 
         if (i + 1) % args.print_freq == 0 and model.module.data.weight.get_device() == 0:
             progress.display(i + 1)
+            if args.use_cr_lrha and getattr(model.module, 'cr_lrha', None) is not None:
+                cr = model.module.cr_lrha
+                print(
+                    'CR-LRHA: refreshed={} refresh_count={} rank={} hvp_calls={} rel_change={:.6f}'.format(
+                        int(cr.last_refreshed),
+                        cr.refresh_count,
+                        cr.last_rank,
+                        cr.hvp_calls,
+                        cr.last_rel_change,
+                    )
+                )
 
     return grad_acc, losses.avg, distill_steps
 

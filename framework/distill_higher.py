@@ -1,5 +1,6 @@
+import math
 import random
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import higher
 import numpy as np
@@ -23,6 +24,28 @@ def _global_grad_norm(parameters) -> torch.Tensor:
     if grad_sq_sum is None:
         return torch.tensor(0.0, device=device if device is not None else "cpu")
     return torch.sqrt(grad_sq_sum + 1e-12)
+
+
+def _flatten_tensors(tensors: Sequence[Optional[torch.Tensor]], refs: Sequence[torch.Tensor]) -> torch.Tensor:
+    parts = []
+    for tensor, ref in zip(tensors, refs):
+        if tensor is None:
+            parts.append(torch.zeros_like(ref).reshape(-1))
+        else:
+            parts.append(tensor.reshape(-1))
+    if len(parts) == 0:
+        return torch.empty(0)
+    return torch.cat(parts)
+
+
+def _unflatten_like(flat: torch.Tensor, refs: Sequence[torch.Tensor]) -> List[torch.Tensor]:
+    tensors = []
+    offset = 0
+    for ref in refs:
+        numel = ref.numel()
+        tensors.append(flat[offset : offset + numel].view_as(ref))
+        offset += numel
+    return tensors
 
 
 class WTPOSelector:
@@ -126,65 +149,171 @@ class WTPOSelector:
 
 class CacheRefreshLRHA:
     """
-    Cache-and-refresh low-rank surrogate for gradient preconditioning.
-    This acts as a lightweight approximation layer in place of repeated full updates.
+    Cache-and-refresh low-rank Hessian approximation.
+
+    The cache stores the U/S/V factors of Eq. (13). Factors are constructed
+    with randomized SVD from Hessian-vector products, and refreshed according
+    to the drift/period rule in Eq. (29)-(31). The factors are then used by the
+    higher grad_callback to replace the inner update gradient with a curvature
+    subspace surrogate inside the differentiable BPTT window.
     """
 
     def __init__(
         self,
         rank: int = 32,
-        refresh_delta: float = 0.05,
+        refresh_delta: float = 0.2,
         refresh_interval: int = 20,
         blend: float = 1.0,
+        oversample: int = 4,
+        power_iter: int = 2,
         eps: float = 1e-8,
     ):
         self.rank = max(1, int(rank))
         self.refresh_delta = float(refresh_delta)
         self.refresh_interval = max(1, int(refresh_interval))
         self.blend = float(max(0.0, min(1.0, blend)))
+        self.oversample = max(0, int(oversample))
+        self.power_iter = max(0, int(power_iter))
         self.eps = eps
 
         self.u: Optional[torch.Tensor] = None
         self.s: Optional[torch.Tensor] = None
-        self.vh: Optional[torch.Tensor] = None
+        self.vt: Optional[torch.Tensor] = None
+        self.pending_refresh = True
+        self.last_refreshed = False
+        self.last_rel_change = 1.0
+        self.last_step = -1
+        self.last_rank = 0
+        self.hvp_calls = 0
         self.refresh_count = 0
 
-    def _fit(self, flat_grad: torch.Tensor) -> None:
-        max_rank = min(flat_grad.shape[0], flat_grad.shape[1])
-        rank = min(self.rank, max_rank)
-        if rank <= 0:
-            self.u = None
-            self.s = None
-            self.vh = None
-            return
-        u, s, vh = torch.linalg.svd(flat_grad, full_matrices=False)
-        self.u = u[:, :rank].detach()
-        self.s = s[:rank].detach()
-        self.vh = vh[:rank, :].detach()
-        self.refresh_count += 1
+    @property
+    def has_cache(self) -> bool:
+        return self.u is not None and self.s is not None and self.vt is not None
 
-    def _project(self, flat_grad: torch.Tensor) -> torch.Tensor:
-        if self.u is None or self.s is None or self.vh is None:
-            return flat_grad
-        approx = (self.u * self.s.unsqueeze(0)) @ self.vh
-        return self.blend * approx + (1.0 - self.blend) * flat_grad
-
-    def apply(self, grad: torch.Tensor, step: int, rel_change: float) -> Tuple[torch.Tensor, bool]:
-        original_shape = grad.shape
-        if grad.ndim == 1:
-            flat_grad = grad.view(1, -1)
-        else:
-            flat_grad = grad.view(grad.shape[0], -1)
-
+    def begin_outer(self, step: int, rel_change: float) -> bool:
         needs_refresh = (
-            self.u is None
+            not self.has_cache
             or rel_change >= self.refresh_delta
             or step % self.refresh_interval == 0
         )
-        if needs_refresh:
-            self._fit(flat_grad.detach())
-        projected = self._project(flat_grad)
-        return projected.view(original_shape), needs_refresh
+        self.pending_refresh = bool(needs_refresh)
+        self.last_refreshed = False
+        self.last_rel_change = float(rel_change)
+        self.last_step = int(step)
+        return needs_refresh
+
+    def _hvp_matrix(
+        self,
+        grads: Sequence[Optional[torch.Tensor]],
+        params: Sequence[torch.Tensor],
+        matrix: torch.Tensor,
+    ) -> torch.Tensor:
+        columns = []
+        active = [
+            (idx, grad, param)
+            for idx, (grad, param) in enumerate(zip(grads, params))
+            if grad is not None and grad.requires_grad and param.requires_grad
+        ]
+        if len(active) == 0:
+            return torch.zeros_like(matrix)
+
+        for col_idx in range(matrix.shape[1]):
+            vecs = _unflatten_like(matrix[:, col_idx], params)
+            active_grads = [grad for _, grad, _ in active]
+            active_params = [param for _, _, param in active]
+            active_vecs = [vecs[idx] for idx, _, _ in active]
+            hvps = torch.autograd.grad(
+                active_grads,
+                active_params,
+                grad_outputs=active_vecs,
+                retain_graph=True,
+                allow_unused=True,
+            )
+            full_hvp: List[Optional[torch.Tensor]] = [torch.zeros_like(param) for param in params]
+            for (idx, _, param), hvp in zip(active, hvps):
+                full_hvp[idx] = torch.zeros_like(param) if hvp is None else hvp
+            columns.append(_flatten_tensors(full_hvp, params).detach())
+            self.hvp_calls += 1
+
+        return torch.stack(columns, dim=1)
+
+    def refresh_from(
+        self,
+        grads: Sequence[Optional[torch.Tensor]],
+        params: Sequence[torch.Tensor],
+        step: int,
+        rel_change: float,
+    ) -> bool:
+        params = list(params)
+        if len(params) == 0:
+            return False
+        flat_dim = sum(param.numel() for param in params)
+        if flat_dim == 0:
+            return False
+
+        device = params[0].device
+        dtype = params[0].dtype
+        sketch_rank = min(flat_dim, self.rank + self.oversample)
+        omega = torch.randn(flat_dim, sketch_rank, device=device, dtype=dtype)
+        omega = omega / math.sqrt(float(sketch_rank))
+
+        y = self._hvp_matrix(grads, params, omega)
+        for _ in range(self.power_iter):
+            y = self._hvp_matrix(grads, params, y)
+
+        if not bool(torch.isfinite(y).all().item()) or float(y.norm().item()) <= self.eps:
+            self.pending_refresh = False
+            self.last_refreshed = False
+            return False
+
+        q, _ = torch.linalg.qr(y, mode="reduced")
+        hq = self._hvp_matrix(grads, params, q)
+        b = q.transpose(0, 1).matmul(hq)
+        b = 0.5 * (b + b.transpose(0, 1))
+        u_small, singular_values, vh_small = torch.linalg.svd(b, full_matrices=False)
+
+        rank = min(self.rank, singular_values.numel())
+        self.u = q.matmul(u_small[:, :rank]).detach()
+        self.s = singular_values[:rank].detach()
+        self.vt = vh_small[:rank, :].matmul(q.transpose(0, 1)).detach()
+        self.last_rank = int(rank)
+        self.refresh_count += 1
+        self.pending_refresh = False
+        self.last_refreshed = True
+        self.last_step = int(step)
+        self.last_rel_change = float(rel_change)
+        return True
+
+    def _apply_low_rank(self, flat_grad: torch.Tensor) -> torch.Tensor:
+        if not self.has_cache:
+            return flat_grad
+        coeff = self.vt.matmul(flat_grad)
+        spectral_scale = self.s / self.s.abs().max().clamp_min(self.eps)
+        approx = self.u.matmul(spectral_scale * coeff)
+        approx_norm = approx.norm().clamp_min(self.eps)
+        grad_norm = flat_grad.norm().clamp_min(self.eps)
+        return approx * (grad_norm / approx_norm)
+
+    def transform_grads(
+        self,
+        grads: Sequence[Optional[torch.Tensor]],
+        params: Sequence[torch.Tensor],
+        step: int,
+        rel_change: float,
+    ) -> List[Optional[torch.Tensor]]:
+        params = list(params)
+        if self.pending_refresh or not self.has_cache:
+            self.refresh_from(grads, params, step=step, rel_change=rel_change)
+
+        flat_grad = _flatten_tensors(grads, params)
+        if not self.has_cache or flat_grad.numel() == 0:
+            return list(grads)
+
+        low_rank_grad = self._apply_low_rank(flat_grad)
+        flat_out = (1.0 - self.blend) * flat_grad + self.blend * low_rank_grad
+        tensors = _unflatten_like(flat_out, params)
+        return [None if grad is None else tensor for grad, tensor in zip(grads, tensors)]
 
 
 class Distill(nn.Module):
@@ -215,9 +344,11 @@ class Distill(nn.Module):
         selector_eps=1e-8,
         use_cr_lrha=True,
         cr_rank=32,
-        cr_delta=0.05,
+        cr_delta=0.2,
         cr_period=20,
         cr_blend=1.0,
+        cr_oversample=4,
+        cr_power_iter=2,
     ):
         super().__init__()
         self.data = nn.Embedding(img_pc * num_classes, int(channel * np.prod(im_size)))
@@ -266,6 +397,8 @@ class Distill(nn.Module):
                 refresh_delta=cr_delta,
                 refresh_interval=cr_period,
                 blend=cr_blend,
+                oversample=cr_oversample,
+                power_iter=cr_power_iter,
                 eps=selector_eps,
             )
             if self.use_cr_lrha
@@ -276,6 +409,7 @@ class Distill(nn.Module):
         self.last_window_size = self.window
         self.last_beta = 1.0
         self.last_cr_refreshed = False
+        self.current_outer_step = 0
         self.dd_type = "at_bptt_pp"
 
     def _model_device(self) -> torch.device:
@@ -293,6 +427,10 @@ class Distill(nn.Module):
         if intervention is None:
             return batch
         return intervention(batch, dtype=dtype, seed=random.randint(0, 10000))
+
+    @staticmethod
+    def _detach_inner_target(labels):
+        return labels.detach() if torch.is_tensor(labels) else labels
 
     def get_task_indices(self):
         task_indices = list(range(self.num_classes))
@@ -324,16 +462,23 @@ class Distill(nn.Module):
             labels = self.label[indices]
         return imgs, labels
 
-    def _collect_trajectory_stats(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        probe_net = get_arch(self.arch, self.num_classes, self.channel, self.im_size).to(self._model_device())
+    def _collect_trajectory_stats(
+        self,
+        probe_net: Optional[nn.Module] = None,
+        probe_optim=None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if probe_net is None:
+            probe_net = get_arch(self.arch, self.num_classes, self.channel, self.im_size).to(self._model_device())
         probe_net.train()
-        probe_optim = self._build_inner_optimizer(probe_net)
+        if probe_optim is None:
+            probe_optim = self._build_inner_optimizer(probe_net)
         grad_norms = []
 
         for _ in range(self.total_unroll_steps):
             probe_optim.zero_grad(set_to_none=True)
             imgs, labels = self.subsample()
             imgs = imgs.detach()
+            labels = self._detach_inner_target(labels)
             imgs = self._apply_intervention(imgs, dtype="syn")
             out, _ = probe_net(imgs)
             loss = self.criterion(out, labels)
@@ -346,9 +491,9 @@ class Distill(nn.Module):
         variation[1:] = (grad_norms[1:] - grad_norms[:-1]).abs()
         return grad_norms, variation
 
-    def _plan_unroll(self) -> Tuple[int, int]:
+    def _plan_unroll(self, probe_net: Optional[nn.Module] = None, probe_optim=None) -> Tuple[int, int]:
         if self.dd_type == "at_bptt_pp":
-            grad_norms, variation = self._collect_trajectory_stats()
+            grad_norms, variation = self._collect_trajectory_stats(probe_net, probe_optim)
             selector_state = self.selector.update_and_sample(grad_norms, variation)
             self.last_truncation_index = int(selector_state["truncation_index"])
             self.last_window_size = int(selector_state["window_size"])
@@ -366,15 +511,40 @@ class Distill(nn.Module):
 
         raise NotImplementedError(f"Unsupported dd_type: {self.dd_type}")
 
-    def _inner_train_step(self, network: nn.Module, optimizer, use_higher: bool = False, diffopt=None) -> None:
+    def set_outer_step(self, step: int) -> None:
+        self.current_outer_step = int(step)
+
+    def _inner_train_step(
+        self,
+        network: nn.Module,
+        optimizer,
+        use_higher: bool = False,
+        diffopt=None,
+        use_cr_lrha: bool = False,
+    ) -> None:
         imgs, labels = self.subsample()
         if not use_higher:
             imgs = imgs.detach()
+            labels = self._detach_inner_target(labels)
         imgs = self._apply_intervention(imgs, dtype="syn")
         out, _ = network(imgs)
         loss = self.criterion(out, labels)
         if use_higher:
-            diffopt.step(loss)
+            grad_callback = None
+            if use_cr_lrha and self.use_cr_lrha and self.cr_lrha is not None:
+                params = tuple(network.parameters())
+
+                def grad_callback(grads):
+                    return self.cr_lrha.transform_grads(
+                        grads,
+                        params,
+                        step=self.current_outer_step,
+                        rel_change=self.last_rel_change,
+                    )
+
+            diffopt.step(loss, grad_callback=grad_callback)
+            if self.cr_lrha is not None:
+                self.last_cr_refreshed = bool(self.cr_lrha.last_refreshed)
             return
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -385,13 +555,34 @@ class Distill(nn.Module):
         self.net.train()
         self.optimizer = self._build_inner_optimizer(self.net)
 
-        prefix_steps, diff_steps = self._plan_unroll()
+        if self.dd_type == "at_bptt_pp":
+            initial_state = {k: v.detach().clone() for k, v in self.net.state_dict().items()}
+            prefix_steps, diff_steps = self._plan_unroll(self.net, self.optimizer)
+            if self.use_cr_lrha and self.cr_lrha is not None:
+                self.cr_lrha.begin_outer(
+                    step=self.current_outer_step,
+                    rel_change=self.last_rel_change,
+                )
+            self.net.load_state_dict(initial_state)
+            self.net.zero_grad(set_to_none=True)
+            self.optimizer = self._build_inner_optimizer(self.net)
+            self.data.weight.grad = None
+            if self.train_y:
+                self.label.weight.grad = None
+        else:
+            prefix_steps, diff_steps = self._plan_unroll()
         for _ in range(prefix_steps):
             self._inner_train_step(self.net, self.optimizer)
 
         with higher.innerloop_ctx(self.net, self.optimizer, copy_initial_weights=True) as (fnet, diffopt):
             for _ in range(diff_steps):
-                self._inner_train_step(fnet, self.optimizer, use_higher=True, diffopt=diffopt)
+                self._inner_train_step(
+                    fnet,
+                    self.optimizer,
+                    use_higher=True,
+                    diffopt=diffopt,
+                    use_cr_lrha=self.dd_type == "at_bptt_pp",
+                )
             x = self._apply_intervention(x, dtype="real")
             return fnet(x)
 
@@ -407,18 +598,7 @@ class Distill(nn.Module):
         if not self.use_cr_lrha or self.cr_lrha is None:
             self.last_cr_refreshed = False
             return False
-        if self.data.weight.grad is None:
-            self.last_cr_refreshed = False
-            return False
-
-        with torch.no_grad():
-            projected_grad, refreshed = self.cr_lrha.apply(
-                self.data.weight.grad.detach(),
-                step=step,
-                rel_change=self.last_rel_change,
-            )
-            self.data.weight.grad.copy_(projected_grad)
-            self.last_cr_refreshed = bool(refreshed)
+        self.last_cr_refreshed = bool(self.cr_lrha.last_refreshed)
         return self.last_cr_refreshed
 
     def ema_init(self, ema_coef):

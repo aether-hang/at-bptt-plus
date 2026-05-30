@@ -402,8 +402,8 @@ def preprocess(train, test, zca_bias=0, regularization=0, permute=True):
     train = (train).dot(global_ZCA)
     test = (test).dot(global_ZCA)
 
-    train_tensor = torch.Tensor(train.reshape(origTrainShape).astype('float64'))
-    test_tensor  = torch.Tensor(test.reshape(origTestShape).astype('float64'))
+    train_tensor = torch.from_numpy(train.reshape(origTrainShape).astype(np.float32))
+    test_tensor  = torch.from_numpy(test.reshape(origTestShape).astype(np.float32))
     if permute:
         train_tensor = train_tensor.permute(0,3,1,2).contiguous()
         test_tensor  = test_tensor.permute(0,3,1,2).contiguous()

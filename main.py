@@ -31,11 +31,12 @@ if __name__ == "__main__":
     parser.add_argument("--num_per_class", default=10, type=int, help="Images per class (IPC)")
     parser.add_argument("--batch_per_class", default=10, type=int, help="Samples per class in each synthetic batch")
     parser.add_argument("--task_sampler_nc", default=10, type=int, help="Classes sampled per synthetic batch")
-    parser.add_argument("--window", default=60, type=int, help="Base truncation window")
+    parser.add_argument("--window", default=16, type=int, help="Base truncation window")
     parser.add_argument("--minwindow", default=0, type=int, help="Legacy argument for curriculum mode")
-    parser.add_argument("--totwindow", default=200, type=int, help="Total trajectory length")
+    parser.add_argument("--totwindow", default=32, type=int, help="Total trajectory length")
     parser.add_argument("--num_train_eval", default=8, type=int, help="Model retrains for evaluation")
     parser.add_argument("--train_y", action="store_true", help="Enable soft-label optimization")
+    parser.add_argument("--freeze_data", action="store_true", help="Keep synthetic images fixed while optimizing labels")
     parser.add_argument("--batch_size", default=5000, type=int, help="Mini-batch size for real data")
     parser.add_argument("--eps", default=1e-8, type=float)
     parser.add_argument("--wd", default=0.0, type=float)
@@ -54,7 +55,7 @@ if __name__ == "__main__":
         help="Distillation strategy",
     )
     parser.add_argument("--cctype", default=0, type=int, help="Legacy curriculum type for RaT-BPTT compatibility")
-    parser.add_argument("--window_radius", default=20, type=int, help="Radius for adaptive window around base window")
+    parser.add_argument("--window_radius", default=8, type=int, help="Radius for adaptive window around base window")
 
     # WTPO selector hyperparameters
     parser.add_argument("--selector_kl", default=1.0, type=float, help="KL coefficient in proximal policy update")
@@ -64,12 +65,15 @@ if __name__ == "__main__":
     # CR-LRHA hyperparameters
     parser.add_argument("--disable_cr_lrha", action="store_true", help="Disable cache-and-refresh low-rank module")
     parser.add_argument("--cr_rank", default=32, type=int, help="Low-rank dimension for CR-LRHA")
-    parser.add_argument("--cr_delta", default=0.05, type=float, help="Refresh threshold for relative drift")
+    parser.add_argument("--cr_delta", default=0.2, type=float, help="Refresh threshold for relative drift")
     parser.add_argument("--cr_period", default=20, type=int, help="Periodic refresh interval")
-    parser.add_argument("--cr_blend", default=1.0, type=float, help="Blend weight for low-rank projected gradient")
+    parser.add_argument("--cr_blend", default=1.0, type=float, help="Blend weight for the LRHA curvature surrogate")
+    parser.add_argument("--cr_oversample", default=4, type=int, help="Randomized-SVD oversampling dimension")
+    parser.add_argument("--cr_power_iter", default=2, type=int, help="Randomized-SVD HVP power iterations")
 
     # Augmentation and logging
     parser.add_argument("--zca", action="store_true")
+    parser.add_argument("--no_normalize_syn", action="store_true", help="Disable projected normalization of synthetic images")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--clip_coef", default=0.9, type=float, help="EMA coefficient for gradient clipping")
     parser.add_argument("--fname", default="at_bptt_pp", type=str, help="Run name suffix for checkpoint files")
@@ -81,16 +85,17 @@ if __name__ == "__main__":
     parser.add_argument("--ckptname", default="none", type=str, help="Checkpoint for distilled data initialization")
     parser.add_argument("--limit_train", action="store_true", help="Use a reduced training split")
     parser.add_argument("--load_ckpt", action="store_true")
+    parser.add_argument("--eval_only", action="store_true", help="Evaluate a loaded distilled set without outer updates")
     parser.add_argument("--complete_random", action="store_true", help="Legacy random curriculum behavior")
 
     args = parser.parse_args()
     args.use_cr_lrha = not args.disable_cr_lrha
+    args.normalize_syn = not args.no_normalize_syn
 
     args.distributed = args.world_size > 1 or args.mp_distributed
     ngpus_per_node = torch.cuda.device_count() if torch.cuda.is_available() else 1
-    args.num_train_eval = int(args.num_train_eval / ngpus_per_node)
-
     if args.mp_distributed:
+        args.num_train_eval = max(1, int(args.num_train_eval / ngpus_per_node))
         args.world_size = ngpus_per_node * args.world_size
         mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
         for _ in range(5):
